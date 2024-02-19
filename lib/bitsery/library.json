@@ -1,0 +1,24 @@
+{
+  "name": "bitsery",
+  "keywords": "binary",
+  "description": "text",
+  "homepage": "https://github.com/fraillt/bitsery",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/fraillt/bitsery.git"
+  },
+  "version": "5.2.2",
+  "authors": {
+    "name": "Mindaugas Vinkelis",
+    "url": "https://github.com/fraillt"
+  },
+  "exclude": [
+    ".github",
+    "extras"
+  ],
+  "frameworks": "*",
+  "platforms": "*",
+  "build": {
+    "libArchive": false
+  }
+}

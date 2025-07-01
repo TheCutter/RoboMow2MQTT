@@ -22,7 +22,7 @@ namespace Robo
 
         WiFiClass::mode(WIFI_MODE_STA);
         WiFiClass::setHostname(HOSTNAME);
-        WiFi.begin(WifiSSID, WifiPW);
+        WiFi.begin(SSID, WIFISECRET);
         WiFi.setAutoReconnect(true);
         WiFi.persistent(true);
 
@@ -61,7 +61,7 @@ namespace Robo
             clientId += String(random(0xffff), HEX);
 
             Serial.println("Connecting to MQTT...");
-            if (mqttClient.connect(clientId.c_str(), this->lastWillTopic, 0, true, "Offline"))
+            if (mqttClient.connect(clientId.c_str(), MQTTUSER, MQTTPASS, this->lastWillTopic, 0, true, "Offline"))       
             {
                 Serial.println("Connected to MQTT.");
                 mqttClient.publish(this->lastWillTopic, "Online", true);

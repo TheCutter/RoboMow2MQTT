@@ -1,9 +1,14 @@
 ﻿#pragma once
 
-#define SSID "YOUR WIFI SSID"
-#define WifiPW "YOUR WIFI PASSWORD"
-#define MQTTIP "YOUR MQTT SERVER IP"
-#define ROBOSERIAL "YOUR ROBO SERIAL NUMBER\0" // \0 Termination required!!!
-#define HOSTNAME "ESP-Robomow"
+#define HOSTNAME "YOUR ROBOMOW ESP NAME"
 
+#define SSID "YOUR WIFI SSID"
+#define WIFISECRET "YOUR WIFI PASSWORD"
+
+#define MQTTIP "YOUR MQTT SERVER IP"
+#define MQTTPORT "YOUR MQTT SERVER PORT"
+#define MQTTUSER "YOUR MQTT SERVER USERNAME"
+#define MQTTPASS "YOUR MQTT SERVER SECRET"
+
+#define ROBOSERIAL "YOUR ROBO SERIAL NUMBER\0" // \0 Termination required!!!
 // Copy template file to "Settings.h" and change to your settings!!!

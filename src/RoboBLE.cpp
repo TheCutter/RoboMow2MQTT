@@ -12,52 +12,43 @@ namespace Robo
 	void RoboBLE::Setup()
 	{
 		Serial.println("Init BLE...");
-		BLEDevice::init(this->deviceName);
-
-        Serial.println("Creating BLESecurity...");
-		BLESecurity bleSecurity;
-		bleSecurity.setAuthenticationMode(ESP_LE_AUTH_REQ_SC_BOND);
-		bleSecurity.setCapability(ESP_IO_CAP_OUT);
-		bleSecurity.setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
-
+		NimBLEDevice::init(this->deviceName);
 		Serial.println("BLE setup complete!");
 	}
 
 	void RoboBLE::Scan()
 	{
-		BLEScan* pBLEScan = BLEDevice::getScan();
+		NimBLEScan* pBLEScan = NimBLEDevice::getScan();
 		pBLEScan->setAdvertisedDeviceCallbacks(this);
+		pBLEScan->setActiveScan(true);
 		pBLEScan->setInterval(1349);
-	    pBLEScan->setWindow(449);
+		pBLEScan->setWindow(449);
 
-		Serial.println("BLE Scan started...");
-		pBLEScan->start(15);
+		Serial.println("[SCAN] Searching for mower (name starts with 'Mo')...");
+		pBLEScan->start(15, false);
 	}
 
-	// Called for each advertising BLE server.
-	void RoboBLE::onResult(BLEAdvertisedDevice* advertisedDevice)
+	void RoboBLE::onResult(NimBLEAdvertisedDevice* advertisedDevice)
 	{
-        // We have found a device, let us now see if it contains the service we are looking for.
+		std::string name = advertisedDevice->getName();
+		if (name.rfind("Mo", 0) != 0) return;
+
 		if (!advertisedDevice->isAdvertisingService(RoboServiceUUID)) {
-            return;
-        }
+			return;
+		}
 
-		BLEDevice::getScan()->stop();
-		this->bleDevice = advertisedDevice;
-        Serial.println("Found Robomow device!");
+		Serial.printf("[SCAN] Mower found: %s (%s)\n",
+		              name.c_str(), advertisedDevice->getAddress().toString().c_str());
 
-        //this->doConnect = true;
+		NimBLEDevice::getScan()->stop();
+		this->bleDevice  = advertisedDevice;
+		this->doConnect  = true;
 	}
 
 	void RoboBLE::Loop()
 	{
-        return;
-
 		if (this->doConnect)
 		{
-			// If the flag "doConnect" is true then we have scanned for and found the desired
-			// BLE Server with which we wish to connect.  Now we connect to it.  Once we are 
-			// connected we set the connected flag to be true.
 			this->doConnect = false;
 			this->ConnectToServer();
 			this->DoAuth();
@@ -65,134 +56,174 @@ namespace Robo
 
 		if (this->connected)
 		{
-			//if (millis() - this->lastNoopTime > 2000)
-			//{
-			//	byte noopData[] = {0xAA, 0x05, 0x1F, 0x1B, 0x16};
-			//	this->lastNoopTime = millis();
-			//	this->dataCharacteristic->writeValue(noopData, 5);
-			//}
+			AutoPoll();
 		}
 	}
 
-    void RoboBLE::Connect()
-    {
-        if (this->bleDevice == nullptr) {
-            Serial.println("No Robomow Device set.");
-            return;
-        }
+	// ─── Auto-polling (every 3 seconds) ──────────────────────────────────────────
 
-        this->ConnectToServer();
-        this->DoAuth();
-    }
+	void RoboBLE::AutoPoll()
+	{
+		if (!this->MessageCreator)   return;
+		if (!this->dataCharacteristic) return;
+		if (millis() - this->lastPollMs < POLL_INTERVAL_MS) return;
+		this->lastPollMs = millis();
+
+		auto req = this->MessageCreator->GetRoboStateMessage();
+		req.ComCount = this->cmdCounter++;
+		if (this->cmdCounter >= 65535) this->cmdCounter = 1;
+
+		auto buffer = this->MessageCreator->SerializeMessage(req);
+
+		this->SendMessage(buffer, [this](byte* pData, size_t length) {
+			this->mowerState = RoboMessageCreator::ParseStateResponse(pData, length);
+			if (this->mowerState.valid && this->onStateUpdate) {
+				this->onStateUpdate(this->mowerState);
+			}
+		});
+	}
+
+	// ─── Start/stop/base command ──────────────────────────────────────────────────
+
+	void RoboBLE::SendCommand(uint8_t mode)
+	{
+		if (!this->MessageCreator) {
+			Serial.println("[CMD] MessageCreator not set");
+			return;
+		}
+		if (!this->connected) {
+			Serial.println("[CMD] Not connected");
+			return;
+		}
+
+		auto cmd = this->MessageCreator->GetAutoOperationMessage(mode);
+		cmd.ComCount = this->cmdCounter++;
+		if (this->cmdCounter >= 65535) this->cmdCounter = 1;
+
+		auto buffer = this->MessageCreator->SerializeMessage(cmd);
+
+		Serial.printf("[CMD] Sending mode=%d\n", mode);
+		this->SendMessage(buffer, nullptr);
+	}
+
+	void RoboBLE::Connect()
+	{
+		if (this->bleDevice == nullptr) {
+			Serial.println("No Robomow Device set.");
+			return;
+		}
+
+		this->ConnectToServer();
+		this->DoAuth();
+	}
 
 	void RoboBLE::DoAuth()
 	{
-		Serial.println("Sending auth...");
+		Serial.println("[AUTH] Starting authentication...");
 
-		if (this->authCharacteristic->canWrite())
-		{
-			std::array<byte, 15> authData{ROBOSERIAL};
-			this->authCharacteristic->writeValue(authData.data(), authData.size(), true);
-			Serial.println("Auth Data send!");
-		}
-		else
-		{
-			Serial.println("The auth characteristic can not be written.");
+		if (!this->authCharacteristic->canWrite()) {
+			Serial.println("[AUTH] Auth char not writable");
+			return;
 		}
 
-		// Read the value of the characteristic.
-		if (this->authCharacteristic->canRead())
-		{
-			const byte value = this->authCharacteristic->readValue<uint8_t>();
-			Serial.printf("The characteristic value was: %x.", value);
+		// Serial number null-padded to 15 bytes (makeAuthConnection)
+		uint8_t snBuf[15] = {0};
+		size_t  snLen     = strlen(ROBOSERIAL);
+		if (snLen > 15) snLen = 15;
+		memcpy(snBuf, ROBOSERIAL, snLen);
 
-			if (value == 1)
-			{
-				this->connected = true;
-                if (this->MessageCreator == nullptr) this->GetRobotConfiguration();
+		Serial.printf("[AUTH] Sending SN: %.15s\n", (char*)snBuf);
+
+		if (!this->authCharacteristic->writeValue(snBuf, 15, true)) {
+			Serial.println("[AUTH] Write failed");
+			return;
+		}
+
+		if (!this->authCharacteristic->canRead()) {
+			Serial.println("[AUTH] Auth char not readable");
+			return;
+		}
+
+		// isAuthenticationSuccessful: all bytes != 0
+		std::string val = this->authCharacteristic->readValue();
+		if (val.empty()) {
+			Serial.println("[AUTH] Response empty");
+			return;
+		}
+		for (unsigned char c : val) {
+			if (c == 0) {
+				Serial.println("[AUTH] Failed (0-byte in response)");
+				return;
 			}
 		}
-		else
-		{
-			Serial.println("The auth characteristic can not be read.");
-		}
+
+		Serial.println("[AUTH] Success");
+		this->connected = true;
+		this->GetRobotConfiguration();
 	}
 
 	bool RoboBLE::GetService()
 	{
-		// Obtain a reference to the service we are after in the remote BLE server.
 		this->remoteService = this->bleClient->getService(RoboServiceUUID);
 		if (this->remoteService == nullptr)
 		{
-			Serial.printf("Failed to find our service UUID: %s.", RoboServiceUUID.toString().c_str());
-
+			Serial.printf("[BLE] Service not found: %s\n", RoboServiceUUID.toString().c_str());
 			this->bleClient->disconnect();
 			return false;
 		}
-
-		Serial.println("Found our service.");
+		Serial.println("[BLE] Service found");
 		return true;
 	}
 
 	bool RoboBLE::GetAuthCharacteristic()
 	{
-		// Obtain a reference to the characteristic in the service of the remote BLE server.
 		this->authCharacteristic = this->remoteService->getCharacteristic(AuthCharUUID);
 		if (this->authCharacteristic == nullptr)
 		{
-			Serial.println("Failed to find auth characteristic.");
-
+			Serial.println("[BLE] Auth char not found");
 			this->bleClient->disconnect();
 			return false;
 		}
 		if (!this->authCharacteristic->canWrite() || !this->authCharacteristic->canRead())
 		{
-			Serial.println("Can not read/write auth characteristic.");
-
+			Serial.println("[BLE] Auth char not readable/writable");
 			this->bleClient->disconnect();
 			return false;
 		}
-
-		Serial.println("Found auth characteristic!");
+		Serial.println("[BLE] Auth char found");
 		return true;
 	}
 
 	bool RoboBLE::GetNotifyCharacteristic()
 	{
+		// Primary: ff00a506
 		this->notifyCharacteristic = this->remoteService->getCharacteristic(NotifyCharUUID);
-		if (this->notifyCharacteristic == nullptr)
-		{
-			Serial.println("Failed to find notify characteristic.");
+		NimBLERemoteCharacteristic* notifyTarget = this->notifyCharacteristic;
 
+		// Fallback: ff00a503 (older firmware)
+		if (!notifyTarget || !notifyTarget->canNotify()) {
+			Serial.println("[BLE] Notify char (a506) unavailable, trying fallback (a503)");
+			notifyTarget = this->dataCharacteristic;
+		}
+
+		if (!notifyTarget || !notifyTarget->canNotify()) {
+			Serial.println("[BLE] No notify char available");
 			this->bleClient->disconnect();
 			return false;
 		}
 
-		if (this->notifyCharacteristic->canNotify())
+		if (!notifyTarget->subscribe(true,
+			[this](NimBLERemoteCharacteristic* c, uint8_t* d, size_t l, bool n) {
+				this->notifyCallback(c, d, l, n);
+			}))
 		{
-			this->notifyCharacteristic->subscribe(true,
-				[this](BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify)
-				{
-					this->notifyCallback(pBLERemoteCharacteristic, pData, length, isNotify);
-				});
-			
-			Serial.println("Registered notify characteristic for notify");
-		}
-		else
-		{
-			Serial.println("Notify characteristic can not notify.");
+			Serial.println("[BLE] Notify subscribe failed");
 			this->bleClient->disconnect();
 			return false;
 		}
 
-		if (!this->notifyCharacteristic->canRead())
-		{
-			Serial.println("Can not read notify characteristic.");
-			this->bleClient->disconnect();
-			return false;
-		}
-
-		Serial.println("Found notify characteristic!");
+		Serial.printf("[BLE] Notifications active (%s)\n",
+		              notifyTarget->getUUID().toString().c_str());
 		return true;
 	}
 
@@ -201,243 +232,152 @@ namespace Robo
 		this->dataCharacteristic = this->remoteService->getCharacteristic(DataCharUUID);
 		if (this->dataCharacteristic == nullptr)
 		{
-			Serial.println("Failed to find data characteristic.");
-
+			Serial.println("[BLE] Data char not found");
 			this->bleClient->disconnect();
 			return false;
 		}
-
-		if (!this->dataCharacteristic->canWrite() || !this->dataCharacteristic->canRead())
+		if (!this->dataCharacteristic->canWrite())
 		{
-			Serial.println("Can not read/write data characteristic.");
-
+			Serial.println("[BLE] Data char not writable");
 			this->bleClient->disconnect();
 			return false;
 		}
-
-		Serial.println("Found data characteristic!");
+		Serial.println("[BLE] Data char found");
 		return true;
 	}
 
 	void RoboBLE::ConnectToServer()
 	{
-		Serial.printf("Forming a connection to %s.", this->bleDevice->getAddress().toString().c_str());
+		Serial.printf("[BLE] Connecting to %s ...\n",
+		              this->bleDevice->getAddress().toString().c_str());
 
-        /** Check if we have a client we should reuse first **/
-        if (NimBLEDevice::getClientListSize())
-        {
-            /** Special case when we already know this device, we send false as the
-             *  second argument in connect() to prevent refreshing the service database.
-             *  This saves considerable time and power.
-             */
-            this->bleClient = NimBLEDevice::getClientByPeerAddress(this->bleDevice->getAddress());
-            Serial.println("Reused Client found");
-
-            if (this->bleClient)
-            {
-                if (!this->bleClient->connect(this->bleDevice, false))
-                {
-                    Serial.println("Reconnect failed");
-                    return;
-                }
-
-                Serial.println("Reconnected client");
-            }
-            /** We don't already have a client that knows this device,
-             *  we will check for a client that is disconnected that we can use.
-             */
-            else
-            {
-                this->bleClient = NimBLEDevice::getDisconnectedClient();
-            }
-        }
-
-        /** No client to reuse? Create a new one. */
-        if (!this->bleClient) {
-            if (NimBLEDevice::getClientListSize() >= NIMBLE_MAX_CONNECTIONS) {
-                Serial.println("Max clients reached - no more connections available");
-                return;
-            }
-
-            this->bleClient = NimBLEDevice::createClient();
-            Serial.println("New client created");
-
-            this->bleClient->setClientCallbacks(this, false);
-
-            /** Set initial connection parameters: These settings are 15ms interval, 0 latency, 120ms timout.
-             *  These settings are safe for 3 clients to connect reliably, can go faster if you have less
-             *  connections. Timeout should be a multiple of the interval, minimum is 100ms.
-             *  Min interval: 12 * 1.25ms = 15, Max interval: 12 * 1.25ms = 15, 0 latency, 51 * 10ms = 510ms timeout
-             */
-            this->bleClient->setConnectionParams(6, 36, 0, 500);
-
-            /** Set how long we are willing to wait for the connection to complete (seconds), default is 30. */
-            this->bleClient->setConnectTimeout(30);
-
-            if (!this->bleClient->connect(this->bleDevice)) {
-                /** Created a client but failed to connect, don't need to keep it as it has no data */
-                NimBLEDevice::deleteClient(this->bleClient);
-                Serial.println("Failed to connect, deleted client");
-                return;
-            }
-        }
-
-        if (!this->bleClient->isConnected()) {
-            Serial.println("Failed to connect");
-            return;
-        }
-
-        Serial.print("Connected to: ");
-        Serial.println(this->bleClient->getPeerAddress().toString().c_str());
-
-        Serial.print("RSSI: ");
-        Serial.println(this->bleClient->getRssi());
-
-		Serial.println("Connected! Getting Characteristics...");
-
-		if (!GetService())
-		{
-			Serial.println("Could not get Service!");
-			return;
+		if (NimBLEDevice::getClientListSize()) {
+			this->bleClient = NimBLEDevice::getClientByPeerAddress(this->bleDevice->getAddress());
+			if (this->bleClient) {
+				if (!this->bleClient->connect(this->bleDevice, false)) {
+					Serial.println("[BLE] Reconnect failed");
+					return;
+				}
+				Serial.println("[BLE] Client reused");
+			} else {
+				this->bleClient = NimBLEDevice::getDisconnectedClient();
+			}
 		}
-		if (!GetAuthCharacteristic())
-		{
-			Serial.println("Could not get Auth Characteristic!");
-			return;
+
+		if (!this->bleClient) {
+			if (NimBLEDevice::getClientListSize() >= NIMBLE_MAX_CONNECTIONS) {
+				Serial.println("[BLE] Max. connections reached");
+				return;
+			}
+			this->bleClient = NimBLEDevice::createClient();
+			this->bleClient->setClientCallbacks(this, false);
+			this->bleClient->setConnectionParams(6, 36, 0, 500);
+			this->bleClient->setConnectTimeout(30);
+
+			if (!this->bleClient->connect(this->bleDevice)) {
+				NimBLEDevice::deleteClient(this->bleClient);
+				this->bleClient = nullptr;
+				Serial.println("[BLE] Connection failed");
+				return;
+			}
 		}
-		if (!GetDataCharacteristic())
-		{
-			Serial.println("Could not get Data Characteristic!");
-			return;
-		}
-		if (!GetNotifyCharacteristic())
-		{
-			Serial.println("Could not get Notify Characteristic!");
+
+		if (!this->bleClient->isConnected()) {
+			Serial.println("[BLE] Not connected after connect()");
 			return;
 		}
 
-		Serial.println("Service and Characteristics created. Connected!");
+		Serial.printf("[BLE] Connected. RSSI: %d\n", this->bleClient->getRssi());
+
+		if (!GetService())            return;
+		if (!GetAuthCharacteristic()) return;
+		if (!GetDataCharacteristic()) return;
+		if (!GetNotifyCharacteristic()) return;
+
+		Serial.println("[BLE] All characteristics ready");
 	}
 
 	#pragma endregion
 
-	void RoboBLE::notifyCallback(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify)
+	void RoboBLE::notifyCallback(NimBLERemoteCharacteristic*, uint8_t* pData, size_t length, bool)
 	{
-		Serial.println("NotifyCallback called");
-
-		char str[64] = "";
-		Utils::array_to_string(pData, length, str);
-		Serial.printf("Notify received with length '%d' and Data: %s.", length, str);
+		// Log raw data (signed as in Java logs)
+		Serial.print("[RX]");
+		for (size_t i = 0; i < length; i++)
+			Serial.printf(" %d", (int8_t)pData[i]);
 		Serial.println();
 
-		if (pData[0] != 170)
-		{
-			Serial.println("Message does not start with byte 170");
+		if (length < 4 || pData[0] != 0xAA) {
+			Serial.println("[RX] Invalid header");
 			return;
 		}
 
-		if (pData[1] < length)
-		{
-			Serial.println("Message length not valid");
-			return;
-		}
-
-		if (pData[1] > length)
-		{
-			//TODO: Long Messages / Multiple Notify Messages
-			return;
-		}
-		
-		if (this->currentCallback)
-		{
+		if (this->currentCallback) {
 			this->currentCallback(pData, length);
 		}
 	}
 
-	void RoboBLE::onConnect(NimBLEClient* pClient)
+	void RoboBLE::onConnect(NimBLEClient*)
 	{
-		Serial.println("Connected to server!");
-        //pClient->updateConnParams(36,36,0,500);
-    }
+		Serial.println("[BLE] onConnect");
+	}
 
-	void RoboBLE::onDisconnect(NimBLEClient* pClient)
+	void RoboBLE::onDisconnect(NimBLEClient*)
 	{
-		Serial.println("Disconnected from server!");
-		this->connected = false;
-		this->doConnect = false;
-
-        this->bleClient->disconnect();
-
-        return;
-
-//		Serial.println("Reset authCharacteristic");
-//		this->authCharacteristic.reset();
-//
-//		Serial.println("Reset dataCharacteristic");
-//		this->dataCharacteristic.reset();
-//
-//		Serial.println("Reset notifyCharacteristic");
-//		this->notifyCharacteristic.reset();
-//
-//        Serial.println("Reset remoteService");
-//		this->remoteService.reset();
-
-        return;
-
-        this->remoteService = nullptr;
-        this->bleDevice = nullptr;
-
-//		Serial.println("Reset bleDevice");
-//		this->bleDevice.reset();
+		Serial.println("[BLE] Disconnected – reconnect on next scan");
+		this->connected            = false;
+		this->doConnect            = false;
+		this->dataCharacteristic   = nullptr;
+		this->notifyCharacteristic = nullptr;
+		this->authCharacteristic   = nullptr;
+		this->remoteService        = nullptr;
 	}
 
 	void RoboBLE::GetRobotConfiguration()
 	{
 		std::vector<byte> configMessage = RoboMessageCreator::GetConfigRequestMessage();
 
-		this->SendMessage(configMessage, [this] (byte* pData, size_t length)
+		this->SendMessage(configMessage, [this](byte* pData, size_t length)
 		{
-			const Robo::ConfigMessageResponse response = RoboMessageCreator::GetConfigResponseMessage(pData, length);
+			const Robo::ConfigMessageResponse response =
+			    RoboMessageCreator::GetConfigResponseMessage(pData, length);
+
 			switch (response.Family)
 			{
 				case Robo::RS:
 					this->MessageCreator.reset(new Robo::RsRoboMessageCreator());
-                    Serial.println("MessageCreator set to RS");
-                    break;
+					Serial.println("[BLE] MessageCreator = RS");
+					break;
 				default:
 					this->MessageCreator.reset();
+					Serial.printf("[BLE] Unknown family: %d\n", response.Family);
 			}
 
-			Serial.printf("Family set to: %d. Software Version: %d. Software Release: %d. Mainboard Version: %d.", response.Family, response.SoftwareVersion, response.SoftwareRelease, response.MainboardVersion);
-			Serial.println();
+			Serial.printf("[CFG] Family=%d SW=%d.%d MB=%d\n",
+			              response.Family, response.SoftwareVersion,
+			              response.SoftwareRelease, response.MainboardVersion);
 		});
 	}
 
 	void RoboBLE::SendMessage(std::vector<byte>& data, BLE_CALLBACK_SIGNATURE callback)
 	{
-		Serial.println("SendMessage called");
-
-		if (!this->connected)
-		{ 
-			Serial.println("Not connected...");
+		if (!this->connected) {
+			Serial.println("[TX] Not connected");
 			return;
 		}
 
 		this->currentCallback = std::move(callback);
 
-		if (data[1] == 0) data[1] = data.size() + 1;
+		if (data[1] == 0) data[1] = (byte)(data.size() + 1);
 
-		Serial.println("Converting Data to String...");
 		byte checksum = RoboMessageCreator::CreateChecksum(data);
 		data.push_back(checksum);
 
-		char str[64] = "";
-		Utils::array_to_string(data.data(), data.size(), str);
-		Serial.printf("Sending data: %s with length '%d'", str, data.size());
+		Serial.print("[TX]");
+		for (size_t i = 0; i < data.size(); i++)
+			Serial.printf(" %d", (int8_t)data[i]);
 		Serial.println();
 
-		Serial.println("Writing message data...");
 		this->dataCharacteristic->writeValue(data.data(), data.size(), true);
-		Serial.println("Message data written.");
 	}
 }

@@ -2,6 +2,7 @@
 
 #include <NimBLEDevice.h>
 #include <memory>
+#include <functional>
 #include <Arduino.h>
 #include <vector>
 
@@ -27,18 +28,25 @@ namespace Robo
 		bool doConnect = false;
 		bool connected = false;
 
-        NimBLEClient* bleClient;
-        NimBLEAdvertisedDevice* bleDevice;
+        NimBLEClient* bleClient = nullptr;
+        NimBLEAdvertisedDevice* bleDevice = nullptr;
 
-        NimBLERemoteService* remoteService;
-		NimBLERemoteCharacteristic* authCharacteristic;
-		NimBLERemoteCharacteristic* notifyCharacteristic;
-		NimBLERemoteCharacteristic* dataCharacteristic;
+        NimBLERemoteService* remoteService = nullptr;
+		NimBLERemoteCharacteristic* authCharacteristic = nullptr;
+		NimBLERemoteCharacteristic* notifyCharacteristic = nullptr;
+		NimBLERemoteCharacteristic* dataCharacteristic = nullptr;
 
-		void onConnect(NimBLEClient* pClient) override; // BLEClientCallbacks
-		void onDisconnect(NimBLEClient* pClient) override; // BLEClientCallbacks
-		void notifyCallback(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify); // NotifyCallback
-		void onResult(NimBLEAdvertisedDevice* advertisedDevice) override; // BLEAdvertisedDeviceCallbacks
+        // Polling
+        uint16_t      cmdCounter  = 1;
+        unsigned long lastPollMs  = 0;
+        static constexpr unsigned long POLL_INTERVAL_MS = 3000UL;
+
+        void AutoPoll();
+
+		void onConnect(NimBLEClient* pClient) override;
+		void onDisconnect(NimBLEClient* pClient) override;
+		void notifyCallback(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify);
+		void onResult(NimBLEAdvertisedDevice* advertisedDevice) override;
 
 		void ConnectToServer();
 		void DoAuth();
@@ -56,11 +64,20 @@ namespace Robo
 
             std::unique_ptr<Robo::RoboMessageCreator> MessageCreator;
 
+            // Current mower state – updated after every poll response
+            MowerState mowerState;
+
+            // Optional callback on state change (e.g. for MQTT publish)
+            std::function<void(const MowerState&)> onStateUpdate;
+
 			void Setup();
 			void Scan();
             void Connect();
 			void Loop();
 			void GetRobotConfiguration();
 			void SendMessage(std::vector<byte>& data, BLE_CALLBACK_SIGNATURE callback);
+
+            // Sends start/stop/base command (LSOperationModes: Stop=0, Edge=1, Scan=2, Base=3)
+            void SendCommand(uint8_t mode);
     };
 }
